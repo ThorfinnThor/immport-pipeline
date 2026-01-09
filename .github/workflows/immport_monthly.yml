@@ -3,7 +3,7 @@ name: ImmPort + External Cytometry Pipeline (Monthly)
 on:
   workflow_dispatch:
   schedule:
-    # Runs on the 1st of every month at 08:00 UTC
+    # Runs on the 1st and 15th of every month at 08:00 UTC
     - cron: "0 8 1,15 * *"
 
 jobs:
@@ -35,12 +35,14 @@ jobs:
       - name: Run external repository discovery (Zenodo + Figshare)
         env:
           OUTPUT_DIR: output
+
           # Optional tokens; add as GitHub Secrets if you want:
           ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
           FIGSHARE_TOKEN: ${{ secrets.FIGSHARE_TOKEN }}
 
           # Controls (optional)
-          ZENODO_MAX_PAGES: "5"
+          ZENODO_MAX_PAGES: "20"
+          CYTOMETRY_CONF_THRESHOLD: "0.45"
           FIGSHARE_MAX_PAGES: "5"
           FIGSHARE_MAX_DETAILS: "50"
         run: |
