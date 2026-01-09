@@ -533,7 +533,7 @@ def main() -> None:
             continue
 
         # stricter filter to avoid junk
-        if float(row.get("cytometry_confidence", 0.0)) >= 0.35:
+        if float(row.get("cytometry_confidence", 0.0)) >= 0.5:
             rows.append(row)
 
     print(f"[Zenodo] After cytometry filter: {sum(1 for r in rows if r['source']=='zenodo')}")
