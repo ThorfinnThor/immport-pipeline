@@ -12,6 +12,15 @@ import requests
 from tqdm import tqdm
 
 # -----------------------------
+# CONFIG (env vars)
+# -----------------------------
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MAX_ROWS = int(os.environ.get("MAX_ROWS", "100"))  # cap for the "final ranked" output
+CLINICAL_TRIAL_ONLY = os.environ.get("CLINICAL_TRIAL_ONLY", "1") in ("1", "true", "True", "yes", "YES")
+
+# -----------------------------
 # Endpoints
 # -----------------------------
 IMMPORT_STUDY_SEARCH = "https://www.immport.org/data/query/api/search/study"
@@ -20,12 +29,9 @@ CTGOV_BASE = "https://clinicaltrials.gov/api/v2"
 PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "immport-cytometry-pipeline-full/2.1"})
+SESSION.headers.update({"User-Agent": "immport-cytometry-pipeline-integrated/5.0"})
 
-NCT_RE = re.compile(r"\bNCT\d{8}\b")
-
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+NCT_RE = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
 
 # -----------------------------
 # HTTP helpers
@@ -67,7 +73,7 @@ def get_text(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3
 # -----------------------------
 def extract_nct_ids(obj: Any) -> List[str]:
     txt = json.dumps(obj, ensure_ascii=False)
-    return sorted(set(NCT_RE.findall(txt)))
+    return sorted(set(re.findall(r"\bNCT\d{8}\b", txt, flags=re.IGNORECASE)))
 
 
 def _count_only(data: Dict[str, Any]) -> int:
@@ -81,17 +87,19 @@ def _count_only(data: Dict[str, Any]) -> int:
 
 def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
     """
-    ImmPort assayMethod matching is typically exact. This probes which strings work.
+    ImmPort assayMethod matching is typically exact/case-sensitive-ish in practice.
+    We probe which strings return hits.
     """
     counts: Dict[str, int] = {}
     for m in assay_methods:
         params = {
-            "clinicalTrial": "Y",
             "assayMethod": m,
             "pageSize": 1,
             "fromRecord": 1,
             "sourceFields": "study_accession",
         }
+        if CLINICAL_TRIAL_ONLY:
+            params["clinicalTrial"] = "Y"
         try:
             data = get_json(IMMPORT_STUDY_SEARCH, params=params)
             counts[m] = _count_only(data)
@@ -101,24 +109,40 @@ def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
 
 
 def search_immport_studies(assay_method: str, page_size: int = 200) -> List[Dict[str, Any]]:
+    """
+    ImmPort /search/study pagination using fromRecord (1-indexed).
+    We also request initial/latest_data_release_date so we can sort by initial date later.
+    """
     from_record = 1
     out: List[Dict[str, Any]] = []
 
     while True:
-        params = {
-            "clinicalTrial": "Y",
+        params: Dict[str, Any] = {
             "assayMethod": assay_method,
             "pageSize": page_size,
             "fromRecord": from_record,
-            "sourceFields": "study_accession,brief_title,pubmed_id,condition_or_disease,assay_method_count",
+            "sourceFields": ",".join(
+                [
+                    "study_accession",
+                    "brief_title",
+                    "pubmed_id",
+                    "condition_or_disease",
+                    "assay_method_count",
+                    "initial_data_release_date",
+                    "latest_data_release_date",
+                ]
+            ),
         }
+        if CLINICAL_TRIAL_ONLY:
+            params["clinicalTrial"] = "Y"
+
         data = get_json(IMMPORT_STUDY_SEARCH, params=params)
 
         hits_block = data.get("hits", {}) or {}
         total_val = (hits_block.get("total", {}) or {}).get("value", None)
         hits = (hits_block.get("hits", []) or [])
 
-        batch = []
+        batch: List[Dict[str, Any]] = []
         for h in hits:
             src = (h or {}).get("_source", {}) or {}
             if src:
@@ -155,6 +179,10 @@ def immport_ui_bundle(sdy: str) -> Dict[str, Any]:
 
 
 def _find_first_date_like(value: Any) -> Optional[str]:
+    """
+    Return first ISO-like date string found in a JSON-serializable value.
+    Accepts: YYYY-MM-DD, YYYY/MM/DD, or YYYY-MM.
+    """
     if value is None:
         return None
     s = str(value)
@@ -168,6 +196,10 @@ def _find_first_date_like(value: Any) -> Optional[str]:
 
 
 def extract_study_year_and_date_from_summary(summary_json: Any) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Your existing approach: try common keys, then regex scan.
+    Returns (year, raw_date_str).
+    """
     if summary_json is None:
         return (None, None)
 
@@ -209,40 +241,12 @@ def extract_study_year_and_date_from_summary(summary_json: Any) -> Tuple[Optiona
 
 
 # -----------------------------
-# CT.gov (Option A)
-# -----------------------------
-def ctgov_get_study(nct: str) -> Dict[str, Any]:
-    return get_json(f"{CTGOV_BASE}/studies/{nct}")
-
-
-def ctgov_status_whystopped(study_json: Dict[str, Any]) -> Tuple[str, str]:
-    proto = (study_json or {}).get("protocolSection", {}) or {}
-    status_mod = proto.get("statusModule", {}) or {}
-    return str(status_mod.get("overallStatus") or ""), str(status_mod.get("whyStopped") or "")
-
-
-def ctgov_failure_score(status: str, why: str) -> Tuple[int, str]:
-    status_l = (status or "").upper()
-    why_l = (why or "").lower()
-
-    score = 0
-    reasons = []
-
-    if status_l in ("TERMINATED", "SUSPENDED", "WITHDRAWN"):
-        score += 2
-        reasons.append(f"status={status_l}")
-
-    if any(k in why_l for k in ["futility", "lack of efficacy", "inefficacy", "ineffective", "insufficient efficacy"]):
-        score += 4
-        reasons.append(f"whyStopped={why[:160]}")
-
-    return score, " | ".join(reasons)
-
-
-# -----------------------------
-# PubMed (Option B fallback)
+# PubMed fetch (title+abstract)
 # -----------------------------
 def efetch_pubmed_title_abstract(pubmed_ids: List[str], batch_size: int = 200, sleep: float = 0.34) -> Dict[str, str]:
+    """
+    Fetch PubMed title + abstract in batches. Returns {pmid: combined_text}.
+    """
     out: Dict[str, str] = {}
     if not pubmed_ids:
         return out
@@ -275,6 +279,70 @@ def efetch_pubmed_title_abstract(pubmed_ids: List[str], batch_size: int = 200, s
     return out
 
 
+# -----------------------------
+# PubMed labeling variant 1 (evidence window)
+# -----------------------------
+FAIL_CUES = [
+    r"did not meet (the )?primary endpoint",
+    r"failed to meet (the )?primary endpoint",
+    r"primary endpoint was not met",
+    r"no significant difference",
+    r"not significantly different",
+    r"did not significantly",
+    r"failed to (improve|reduce|increase)",
+    r"showed no (significant )?benefit",
+]
+SUCCESS_CUES = [
+    r"met (the )?primary endpoint",
+    r"primary endpoint was met",
+    r"significantly (improved|reduced|increased)",
+    r"demonstrated (a )?significant (benefit|improvement)",
+]
+
+
+def label_from_text_evidence_window(text: str) -> Tuple[str, str]:
+    """
+    Label met/not_met/unknown from PubMed title+abstract text,
+    and return an evidence snippet around the first match.
+    """
+    if not text:
+        return ("unknown", "")
+
+    t = " ".join(text.split())
+    tl = t.lower()
+
+    for pat in FAIL_CUES:
+        m = re.search(pat, tl)
+        if m:
+            start = max(0, m.start() - 80)
+            end = min(len(t), m.end() + 80)
+            return ("not_met", t[start:end])
+
+    for pat in SUCCESS_CUES:
+        m = re.search(pat, tl)
+        if m:
+            start = max(0, m.start() - 80)
+            end = min(len(t), m.end() + 80)
+            return ("met", t[start:end])
+
+    return ("unknown", "")
+
+
+def extract_ncts_from_text(text: str) -> str:
+    if not text:
+        return ""
+    return ";".join(sorted(set(NCT_RE.findall(text))))
+
+
+def merge_ncts(a: str, b: str) -> str:
+    aset = set([x for x in str(a).split(";") if x.upper().startswith("NCT")])
+    bset = set([x for x in str(b).split(";") if x.upper().startswith("NCT")])
+    return ";".join(sorted(aset | bset))
+
+
+# -----------------------------
+# PubMed labeling variant 2 (weighted scoring)
+# -----------------------------
 FAIL_PATTERNS = [
     (4, r"did not meet (the )?primary endpoint"),
     (4, r"failed to meet (the )?primary endpoint"),
@@ -302,6 +370,10 @@ SUCCESS_PATTERNS = [
 
 
 def pubmed_scored_label(text: str) -> Tuple[str, int, str]:
+    """
+    Returns (label, score, evidence_patterns).
+    score > 0 => failure leaning; score < 0 => success leaning.
+    """
     if not text:
         return ("unknown", 0, "")
 
@@ -328,9 +400,49 @@ def pubmed_scored_label(text: str) -> Tuple[str, int, str]:
 
 
 # -----------------------------
-# Fusion
+# CT.gov scoring
+# -----------------------------
+def ctgov_get_study(nct: str) -> Dict[str, Any]:
+    return get_json(f"{CTGOV_BASE}/studies/{nct}")
+
+
+def ctgov_status_whystopped(study_json: Dict[str, Any]) -> Tuple[str, str]:
+    proto = (study_json or {}).get("protocolSection", {}) or {}
+    status_mod = proto.get("statusModule", {}) or {}
+    return str(status_mod.get("overallStatus") or ""), str(status_mod.get("whyStopped") or "")
+
+
+def ctgov_failure_signal(status: str, why: str) -> Tuple[int, str]:
+    """
+    Convert CT.gov status + whyStopped into a failure score.
+    """
+    status_l = (status or "").upper()
+    why_l = (why or "").lower()
+
+    score = 0
+    reasons = []
+
+    if status_l in ("TERMINATED", "SUSPENDED", "WITHDRAWN"):
+        score += 2
+        reasons.append(f"status={status_l}")
+
+    if any(k in why_l for k in ["futility", "lack of efficacy", "inefficacy", "ineffective", "insufficient efficacy"]):
+        score += 4
+        reasons.append(f"whyStopped={why[:160]}")
+
+    return score, " | ".join(reasons)
+
+
+# -----------------------------
+# Fusion (PubMed scored first, CT.gov second)
 # -----------------------------
 def fuse_labels(pub_label: str, pub_score: int, ct_score: int) -> Tuple[str, str]:
+    """
+    Rules:
+    - If PubMed clearly says met/not_met (score threshold), trust it.
+    - Else if CT.gov has strong futility/lack-of-efficacy => not_met.
+    - Else unknown.
+    """
     if pub_label == "not_met" and pub_score >= 4:
         return "not_met", "high: PubMed text"
     if pub_label == "met" and pub_score <= -4:
@@ -345,31 +457,27 @@ def fuse_labels(pub_label: str, pub_score: int, ct_score: int) -> Tuple[str, str
 
 
 # -----------------------------
-# Sorting helpers
+# Sorting: initial date newest -> oldest
 # -----------------------------
-def tech_sort_key(technology: str) -> int:
-    s = (technology or "").lower()
-    if "flow" in s:
-        return 0
-    if "cytof" in s or "mass" in s:
-        return 1
-    return 9
+def parse_iso_date_tuple(s: Any) -> Tuple[int, int, int]:
+    """
+    Returns (YYYY, MM, DD) for sorting. Missing/invalid -> (0,0,0).
+    Expects ImmPort initial_data_release_date like 'YYYY-MM-DD'.
+    """
+    if s is None:
+        return (0, 0, 0)
+    txt = str(s).strip()
+    m = re.search(r"\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b", txt)
+    if not m:
+        return (0, 0, 0)
+    y, mo, d = m.group(0).split("-")
+    return (int(y), int(mo), int(d))
 
 
-def safe_int_year(x: Any) -> int:
-    try:
-        if pd.isna(x):
-            return -1
-        return int(str(x).strip())
-    except Exception:
-        return -1
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    # Flow Cytometry synonyms (ImmPort exact-match; we probe which ones work)
+def main() -> None:
+    # -----------------------------
+    # 1) Determine working assayMethod strings (probe)
+    # -----------------------------
     FLOW_CANDIDATES = [
         "Flow Cytometry",
         "Flow cytometry",
@@ -379,12 +487,11 @@ def main():
         "Fluorescence activated cell sorting (FACS)",
     ]
 
-    # CyTOF/Mass Cytometry synonyms (probe which ones work)
     CYTOF_CANDIDATES = [
-        "Mass Cytometry",
-        "Mass cytometry",
         "CyTOF",
         "CYTOF",
+        "Mass Cytometry",
+        "Mass cytometry",
         "Cytometry by time-of-flight",
         "Cytometry by Time-of-Flight",
         "Time-of-flight cytometry",
@@ -392,38 +499,34 @@ def main():
         "CyTOF (Mass Cytometry)",
     ]
 
-    print("Probing Flow Cytometry assayMethod vocabulary…")
+    print("Probing Flow Cytometry assayMethod strings...")
     flow_counts = probe_assay_methods(FLOW_CANDIDATES)
     for k, v in flow_counts.items():
         print(f"  {k!r}: {v}")
-    WORKING_FLOW = [k for k, v in flow_counts.items() if v and v > 0]
-    if not WORKING_FLOW:
-        # Fallback to the canonical value if probing fails for any reason
-        WORKING_FLOW = ["Flow Cytometry"]
-        print("WARNING: No Flow synonyms returned hits; falling back to 'Flow Cytometry' only.")
-    else:
-        print(f"Using Flow assay methods: {WORKING_FLOW}")
+    working_flow = [k for k, v in flow_counts.items() if v and v > 0]
+    if not working_flow:
+        working_flow = ["Flow Cytometry"]
+        print("WARNING: No Flow synonym returned hits; falling back to 'Flow Cytometry'.")
 
-    print("\nProbing CyTOF/Mass cytometry assayMethod vocabulary…")
+    print("\nProbing CyTOF/Mass Cytometry assayMethod strings...")
     cy_counts = probe_assay_methods(CYTOF_CANDIDATES)
     for k, v in cy_counts.items():
         print(f"  {k!r}: {v}")
-    WORKING_CYTOF = [k for k, v in cy_counts.items() if v and v > 0]
-    if WORKING_CYTOF:
-        print(f"Using CyTOF assay methods: {WORKING_CYTOF}")
-    else:
-        print("WARNING: No CyTOF methods returned hits. Proceeding without CyTOF.")
+    working_cytof = [k for k, v in cy_counts.items() if v and v > 0]
+    if not working_cytof:
+        print("WARNING: No CyTOF synonym returned hits; proceeding without CyTOF.")
 
-    # Search plan: (exact query string, normalized technology label)
     search_plan: List[Tuple[str, str]] = []
-    for m in WORKING_FLOW:
+    for m in working_flow:
         search_plan.append((m, "Flow Cytometry"))
-    for m in WORKING_CYTOF:
+    for m in working_cytof:
         search_plan.append((m, "CyTOF/Mass Cytometry"))
 
-    # Pull ImmPort studies + UI enrichment
+    # -----------------------------
+    # 2) ImmPort search + UI enrichment
+    # -----------------------------
     all_rows: List[Dict[str, Any]] = []
-    seen = set()  # (SDY, technology) dedup
+    seen = set()  # (SDY, technology)
 
     for assay_method_query, technology in search_plan:
         studies = search_immport_studies(assay_method_query, page_size=200)
@@ -462,6 +565,8 @@ def main():
                     "nct_ids": ";".join(ncts),
                     "study_year": year if year is not None else "",
                     "study_date_raw": date_raw if date_raw is not None else "",
+                    "initial_data_release_date": s.get("initial_data_release_date", ""),
+                    "latest_data_release_date": s.get("latest_data_release_date", ""),
                     "ui_bundle_has_studyfile": has_studyfile,
                     "ui_bundle_error": ui_err,
                 }
@@ -469,7 +574,13 @@ def main():
 
     df = pd.DataFrame(all_rows).reset_index(drop=True)
 
-    # Batch fetch PubMed texts
+    out_candidates = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates.csv")
+    df.to_csv(out_candidates, index=False)
+    print(f"\nWrote {out_candidates} ({len(df)} rows)")
+
+    # -----------------------------
+    # 3) PubMed fetch once (unique PMIDs)
+    # -----------------------------
     df["pubmed_id"] = df["pubmed_id"].fillna("").astype(str)
     unique_pmids = sorted(
         set(
@@ -479,13 +590,18 @@ def main():
             if pmid.strip().isdigit()
         )
     )
-    print(f"\nUnique PubMed IDs: {len(unique_pmids)}")
+    print(f"Unique PubMed IDs: {len(unique_pmids)}")
     pub_texts = efetch_pubmed_title_abstract(unique_pmids, batch_size=200)
 
-    # PubMed scoring per row
-    pub_labels, pub_scores, pub_evidence = [], [], []
-    for _, r in tqdm(df.iterrows(), total=len(df), desc="PubMed scoring"):
+    # -----------------------------
+    # 4) PubMed labeling per row (both variants) + extract NCTs from PubMed text
+    # -----------------------------
+    labels_v1, evidence_v1, ncts_from_pubmed = [], [], []
+    labels_scored, scores_scored, evidence_scored = [], [], []
+
+    for _, r in tqdm(df.iterrows(), total=len(df), desc="PubMed label + NCT extract"):
         pmids = [p for p in str(r["pubmed_id"]).split(";") if p.strip().isdigit()]
+
         text = ""
         used = ""
         for p in pmids:
@@ -493,19 +609,41 @@ def main():
                 text = pub_texts[p]
                 used = p
                 break
-        lab, sc, ev = pubmed_scored_label(text)
-        pub_labels.append(lab)
-        pub_scores.append(sc)
-        pub_evidence.append(f"pmid={used} | {ev}")
 
-    df["pubmed_label_scored"] = pub_labels
-    df["pubmed_score"] = pub_scores
-    df["pubmed_evidence_patterns"] = pub_evidence
+        # Variant 1: label + evidence window
+        lab1, ev1 = label_from_text_evidence_window(text)
+        labels_v1.append(lab1)
+        evidence_v1.append(ev1)
 
-    # CT.gov scoring per row (best-of up to 5 NCTs)
+        # Extract NCT IDs from PubMed text
+        ncts_from_pubmed.append(extract_ncts_from_text(text))
+
+        # Variant 2: scored label
+        lab2, sc2, ev2 = pubmed_scored_label(text)
+        labels_scored.append(lab2)
+        scores_scored.append(sc2)
+        evidence_scored.append(f"pmid={used} | {ev2}".strip())
+
+    df["outcome_label_pubmed"] = labels_v1
+    df["outcome_evidence_pubmed"] = evidence_v1
+    df["nct_ids_from_pubmed"] = ncts_from_pubmed
+    df["nct_ids_merged"] = [merge_ncts(a, b) for a, b in zip(df.get("nct_ids", ""), df["nct_ids_from_pubmed"])]
+
+    df["pubmed_label_scored"] = labels_scored
+    df["pubmed_score"] = scores_scored
+    df["pubmed_evidence_patterns"] = evidence_scored
+
+    out_pubmed = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_pubmed_labeled.csv")
+    df.to_csv(out_pubmed, index=False)
+    print(f"Wrote {out_pubmed}")
+
+    # -----------------------------
+    # 5) CT.gov scoring (best-of up to 5 NCTs)
+    # -----------------------------
     ct_statuses, ct_whys, ct_scores, ct_reasons = [], [], [], []
+
     for _, r in tqdm(df.iterrows(), total=len(df), desc="CT.gov status/why"):
-        ncts = [x for x in str(r["nct_ids"]).split(";") if x.startswith("NCT")]
+        ncts = [x.strip() for x in str(r["nct_ids_merged"]).split(";") if x.strip().upper().startswith("NCT")]
         if not ncts:
             ct_statuses.append("")
             ct_whys.append("")
@@ -520,9 +658,9 @@ def main():
 
         for nct in ncts[:5]:
             try:
-                cj = ctgov_get_study(nct)
+                cj = ctgov_get_study(nct.upper())
                 status, why = ctgov_status_whystopped(cj)
-                sc, rsn = ctgov_failure_score(status, why)
+                sc, rsn = ctgov_failure_signal(status, why)
                 if sc > best_score:
                     best_score = sc
                     best_status = status
@@ -541,7 +679,9 @@ def main():
     df["ctgov_failure_score"] = ct_scores
     df["ctgov_failure_reason"] = ct_reasons
 
-    # Fuse
+    # -----------------------------
+    # 6) Fusion
+    # -----------------------------
     final_label, confidence = [], []
     for _, r in df.iterrows():
         lab, conf = fuse_labels(
@@ -555,29 +695,47 @@ def main():
     df["final_outcome_label"] = final_label
     df["final_confidence"] = confidence
 
-    # Rank & sort: year desc, technology (Flow first), then label rank
-    df["year_int"] = df["study_year"].apply(safe_int_year)
-    df["tech_order"] = df["technology"].apply(tech_sort_key)
-
-    label_rank = {"not_met": 0, "not_met_candidate": 1, "unknown": 2, "met": 3}
-    df["label_rank"] = df["final_outcome_label"].map(label_rank).fillna(99).astype(int)
-
-    df_ranked = df.sort_values(
-        by=["year_int", "tech_order", "label_rank", "study_accession"],
-        ascending=[False, True, True, True],
-    ).drop(columns=["year_int", "tech_order", "label_rank"]).reset_index(drop=True)
-
-    # Write outputs (IMPORTANT: keep ranked filename for email attachment)
+    # -----------------------------
+    # 7) Outputs
+    # -----------------------------
     out_full = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full.csv")
-    out_ranked = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_ranked.csv")
-
     df.to_csv(out_full, index=False)
-    df_ranked.to_csv(out_ranked, index=False)
+    print(f"Wrote {out_full}")
 
-    print(f"\nWrote: {out_full}")
-    print(f"Wrote: {out_ranked}")
-    print("\nFinal label counts:")
-    print(df_ranked["final_outcome_label"].value_counts(dropna=False))
+    # A) REQUIRED BY YOU: final CSV ordered by initial_data_release_date newest -> oldest
+    df_sorted = df.copy()
+    df_sorted["initial_date_key"] = df_sorted["initial_data_release_date"].apply(parse_iso_date_tuple)
+    # if initial_date missing, use latest_date as a secondary key (helps ordering)
+    df_sorted["latest_date_key"] = df_sorted["latest_data_release_date"].apply(parse_iso_date_tuple)
+
+    df_sorted = df_sorted.sort_values(
+        by=["initial_date_key", "latest_date_key", "study_accession"],
+        ascending=[False, False, True],
+    ).drop(columns=["initial_date_key", "latest_date_key"]).reset_index(drop=True)
+
+    df_final = df_sorted.head(MAX_ROWS).copy()
+    out_final_ranked = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_ranked.csv")
+    df_final.to_csv(out_final_ranked, index=False)
+    print(f"Wrote {out_final_ranked} (sorted by initial_data_release_date, capped to MAX_ROWS={MAX_ROWS})")
+
+    # B) Additional useful output: rank by "failed" first (like your second script)
+    df_failed = df.copy()
+    rank_map = {"not_met": 0, "not_met_candidate": 1, "unknown": 2, "met": 3}
+    df_failed["rank"] = df_failed["final_outcome_label"].map(rank_map).fillna(99).astype(int)
+    df_failed = df_failed.sort_values(
+        ["rank", "ctgov_failure_score", "pubmed_score"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+
+    out_failed = os.path.join(OUTPUT_DIR, "immport_failed_trials_ranked.csv")
+    df_failed.to_csv(out_failed, index=False)
+    print(f"Wrote {out_failed}")
+
+    print("\nFinal label counts (full):")
+    print(df["final_outcome_label"].value_counts(dropna=False))
+
+    print("\nFinal label counts (failed-ranked):")
+    print(df_failed["final_outcome_label"].value_counts(dropna=False))
 
 
 if __name__ == "__main__":
