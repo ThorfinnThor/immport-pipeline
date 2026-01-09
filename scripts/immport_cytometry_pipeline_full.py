@@ -16,20 +16,11 @@ from tqdm import tqdm
 # -----------------------------
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 
-# Keep <= 100 rows (mixed) as you requested.
+# Keep <= 100 rows (your request)
 MAX_ROWS = int(os.environ.get("MAX_ROWS", "100"))
 
 # If 1: require ImmPort clinicalTrial=Y (your original behavior)
 CLINICAL_TRIAL_ONLY = os.environ.get("CLINICAL_TRIAL_ONLY", "1") in ("1", "true", "True", "yes", "YES")
-
-# Gemini optional
-GEMINI_ENABLED = os.environ.get("GEMINI_ENABLED", "1") in ("1", "true", "True", "yes", "YES")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
-GEMINI_MAX_CALLS = int(os.environ.get("GEMINI_MAX_CALLS", "25"))  # keep low for free tier
-GEMINI_SLEEP_SECONDS = float(os.environ.get("GEMINI_SLEEP_SECONDS", "1.2"))  # reduce 429
-GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "60"))
-GEMINI_MIN_CONFIDENCE = float(os.environ.get("GEMINI_MIN_CONFIDENCE", "0.75"))
 
 # -----------------------------
 # Endpoints
@@ -38,10 +29,9 @@ IMMPORT_STUDY_SEARCH = "https://www.immport.org/data/query/api/search/study"
 IMMPORT_UI_BASE = "https://www.immport.org/data/query/ui"
 CTGOV_BASE = "https://clinicaltrials.gov/api/v2"
 PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "immport-cytometry-pipeline-full/4.0"})
+SESSION.headers.update({"User-Agent": "immport-cytometry-pipeline-nogemini/1.0"})
 
 NCT_RE = re.compile(r"\bNCT\d{8}\b")
 
@@ -81,19 +71,6 @@ def get_text(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3
     raise RuntimeError(f"GET TEXT failed: {url} params={params} err={last_err}")
 
 
-def post_json_capture(url: str, payload: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> Tuple[int, str, Optional[Dict[str, Any]]]:
-    """
-    Returns (status_code, text_snippet, json_obj_or_none)
-    """
-    r = SESSION.post(url, params=params, json=payload, timeout=GEMINI_TIMEOUT)
-    txt = r.text or ""
-    try:
-        js = r.json()
-    except Exception:
-        js = None
-    return r.status_code, txt[:600], js
-
-
 # -----------------------------
 # ImmPort search
 # -----------------------------
@@ -118,9 +95,6 @@ def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
 
 
 def search_immport_studies(assay_method: str, page_size: int = 200) -> List[Dict[str, Any]]:
-    """
-    Paginates ImmPort study search.
-    """
     from_record = 1
     out: List[Dict[str, Any]] = []
 
@@ -179,19 +153,6 @@ def immport_ui_bundle(sdy: str) -> Dict[str, Any]:
 def extract_nct_ids(obj: Any) -> List[str]:
     txt = json.dumps(obj, ensure_ascii=False)
     return sorted(set(NCT_RE.findall(txt)))
-
-
-def parse_year_from_release_dates(initial_date: Any, latest_date: Any) -> Optional[int]:
-    """
-    Prefer release dates because they are reliable in ImmPort search response.
-    """
-    for v in (latest_date, initial_date):
-        if not v:
-            continue
-        m = re.search(r"\b(19|20)\d{2}\b", str(v))
-        if m:
-            return int(m.group(0))
-    return None
 
 
 # -----------------------------
@@ -308,107 +269,7 @@ def ctgov_failure_score(status: str, why: str) -> Tuple[int, str]:
 
 
 # -----------------------------
-# Gemini (optional fallback)
-# -----------------------------
-def _extract_candidate_text(resp_json: Optional[Dict[str, Any]]) -> str:
-    if not resp_json:
-        return ""
-    try:
-        return str(resp_json["candidates"][0]["content"]["parts"][0]["text"])
-    except Exception:
-        return ""
-
-
-def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    s = text.strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
-
-
-def gemini_label_primary_endpoint(title_abstract: str) -> Tuple[str, float, str, str, int, str]:
-    """
-    Returns:
-      label in {met, not_met, unknown},
-      confidence 0..1,
-      reason,
-      evidence,
-      http_status,
-      http_error_snippet
-    """
-    if not (GEMINI_ENABLED and GEMINI_API_KEY):
-        return ("", 0.0, "disabled_or_no_key", "", 0, "")
-
-    url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
-    params = {"key": GEMINI_API_KEY}
-
-    prompt = (
-        "You are a cautious clinical trial analyst.\n"
-        "Decide whether the PRIMARY endpoint/aims were met based ONLY on the text provided.\n"
-        "If the text does not explicitly state met/not met (or equivalent), return unknown.\n"
-        "Return ONLY valid JSON with keys: label, confidence, reason, evidence.\n"
-        'label must be "met", "not_met", or "unknown". confidence is 0..1.\n'
-        "evidence must be a short quote (<=25 words) copied from the text, or empty.\n\n"
-        "TEXT:\n"
-        f"{title_abstract[:9000]}"
-    )
-
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": 256,
-            # IMPORTANT: correct camelCase field name
-            "responseMimeType": "application/json",
-        },
-    }
-
-    # Retry logic for 429 / transient errors with exponential backoff
-    for attempt in range(5):
-        time.sleep(GEMINI_SLEEP_SECONDS)
-
-        status, txt_snip, js = post_json_capture(url, payload=payload, params=params)
-
-        if status == 200:
-            cand_text = _extract_candidate_text(js)
-            obj = _parse_json_loose(cand_text)
-            if not obj:
-                return ("unknown", 0.0, "gemini_parse_failed", cand_text[:200], 200, "")
-            label = str(obj.get("label", "unknown")).strip().lower()
-            if label not in ("met", "not_met", "unknown"):
-                label = "unknown"
-            try:
-                conf = float(obj.get("confidence", 0.0))
-            except Exception:
-                conf = 0.0
-            conf = max(0.0, min(1.0, conf))
-            reason = str(obj.get("reason", "")).strip()[:240]
-            evidence = str(obj.get("evidence", "")).strip()[:240]
-            return (label, conf, reason, evidence, 200, "")
-
-        # Rate limit / quota
-        if status == 429:
-            time.sleep(3.0 * (attempt + 1))
-            continue
-
-        # Other errors: stop and record
-        return ("unknown", 0.0, "gemini_http_error", "", status, txt_snip)
-
-    return ("unknown", 0.0, "gemini_rate_limited", "", 429, "too many requests")
-
-
-# -----------------------------
-# Fusion + sorting/capping
+# Fusion + sort/cap
 # -----------------------------
 def fuse_baseline(pub_label: str, pub_score: int, ct_score: int) -> Tuple[str, str]:
     if pub_label == "not_met" and pub_score >= 4:
@@ -424,49 +285,26 @@ def fuse_baseline(pub_label: str, pub_score: int, ct_score: int) -> Tuple[str, s
     return "unknown", "low: no deterministic signal"
 
 
-def tech_order(technology: str) -> int:
-    t = (technology or "").lower()
-    if "flow" in t:
-        return 0
-    return 1  # CyTOF/Mass second
-
-
-def safe_int(x: Any) -> int:
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return -1
-
-
-def cap_mixed(df_sorted: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+def to_date_sort_key(s: Any) -> Tuple[int, int, int]:
     """
-    Keep <= max_rows but preserve mixture: roughly half flow / half cytof if possible.
-    Then re-sort by year desc + tech order.
+    Sort key for initial_data_release_date (newest first later by reverse=True):
+    Returns (year, month, day); missing => (0,0,0)
+    Accepts 'YYYY-MM-DD' or similar.
     """
+    if s is None:
+        return (0, 0, 0)
+    txt = str(s).strip()
+    m = re.search(r"\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b", txt)
+    if not m:
+        return (0, 0, 0)
+    parts = m.group(0).split("-")
+    return (int(parts[0]), int(parts[1]), int(parts[2]))
+
+
+def cap_latest(df_sorted: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     if len(df_sorted) <= max_rows:
         return df_sorted
-
-    flow = df_sorted[df_sorted["technology"].str.contains("Flow", na=False)].copy()
-    cytof = df_sorted[df_sorted["technology"].str.contains("CyTOF", na=False)].copy()
-
-    half = max_rows // 2
-    take_flow = min(len(flow), half)
-    take_cytof = min(len(cytof), max_rows - take_flow)
-
-    # if one side is small, fill with the other
-    if take_flow < half:
-        take_cytof = min(len(cytof), max_rows - take_flow)
-    if take_cytof < (max_rows - take_flow):
-        take_flow = min(len(flow), max_rows - take_cytof)
-
-    out = pd.concat([flow.head(take_flow), cytof.head(take_cytof)], ignore_index=True)
-
-    out["year_int"] = out["study_year"].apply(safe_int)
-    out["tech_ord"] = out["technology"].apply(tech_order)
-    out = out.sort_values(["year_int", "tech_ord", "study_accession"], ascending=[False, True, True]).drop(
-        columns=["year_int", "tech_ord"], errors="ignore"
-    )
-    return out.reset_index(drop=True)
+    return df_sorted.head(max_rows).reset_index(drop=True)
 
 
 # -----------------------------
@@ -475,7 +313,7 @@ def cap_mixed(df_sorted: pd.DataFrame, max_rows: int) -> pd.DataFrame:
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Assay method probes (this is the “earlier stable approach”)
+    # Keep the stable assay strings you already observed working
     FLOW_CANDIDATES = [
         "Flow Cytometry",
         "Flow cytometry",
@@ -507,8 +345,9 @@ def main():
     for k, v in cy_counts.items():
         print(f"  {k!r}: {v}")
     working_cytof = [k for k, v in cy_counts.items() if v and v > 0]
+    if not working_cytof:
+        print("WARNING: No CyTOF assay method variant returned hits. Proceeding without CyTOF.")
 
-    # Search plan: we keep technology label stable
     search_plan: List[Tuple[str, str]] = []
     for m in working_flow:
         search_plan.append((m, "Flow Cytometry"))
@@ -543,8 +382,6 @@ def main():
                 ui_err = str(e)
                 has_studyfile = False
 
-            year = parse_year_from_release_dates(s.get("initial_data_release_date"), s.get("latest_data_release_date"))
-
             all_rows.append(
                 {
                     "study_accession": sdy,
@@ -554,7 +391,6 @@ def main():
                     "pubmed_id": ";".join(s.get("pubmed_id", [])) if isinstance(s.get("pubmed_id"), list) else (s.get("pubmed_id") or ""),
                     "condition_or_disease": ";".join(s.get("condition_or_disease", [])) if isinstance(s.get("condition_or_disease"), list) else (s.get("condition_or_disease") or ""),
                     "nct_ids": ";".join(ncts),
-                    "study_year": year if year is not None else "",
                     "initial_data_release_date": s.get("initial_data_release_date", ""),
                     "latest_data_release_date": s.get("latest_data_release_date", ""),
                     "ui_bundle_has_studyfile": has_studyfile,
@@ -564,7 +400,7 @@ def main():
 
     df = pd.DataFrame(all_rows).reset_index(drop=True)
 
-    # -------- PubMed batch --------
+    # PubMed fetch + scoring
     df["pubmed_id"] = df["pubmed_id"].fillna("").astype(str)
     unique_pmids = sorted(
         set(
@@ -577,7 +413,7 @@ def main():
     print(f"\nUnique PubMed IDs: {len(unique_pmids)}")
     pub_texts = efetch_pubmed_title_abstract(unique_pmids, batch_size=200)
 
-    pub_labels, pub_scores, pub_evidence, pub_text_used = [], [], [], []
+    pub_labels, pub_scores, pub_evidence = [], [], []
     for _, r in tqdm(df.iterrows(), total=len(df), desc="PubMed scoring"):
         pmids = [p for p in str(r["pubmed_id"]).split(";") if p.strip().isdigit()]
         text = ""
@@ -591,13 +427,12 @@ def main():
         pub_labels.append(lab)
         pub_scores.append(sc)
         pub_evidence.append(f"pmid={used} | {ev}".strip())
-        pub_text_used.append(text)
 
     df["pubmed_label_scored"] = pub_labels
     df["pubmed_score"] = pub_scores
     df["pubmed_evidence_patterns"] = pub_evidence
 
-    # -------- CT.gov --------
+    # CT.gov scoring
     ct_statuses, ct_whys, ct_scores, ct_reasons = [], [], [], []
     for _, r in tqdm(df.iterrows(), total=len(df), desc="CT.gov status/why"):
         ncts = [x for x in str(r["nct_ids"]).split(";") if x.startswith("NCT")]
@@ -636,121 +471,35 @@ def main():
     df["ctgov_failure_score"] = ct_scores
     df["ctgov_failure_reason"] = ct_reasons
 
-    # -------- Baseline fusion --------
-    base_label, base_conf = [], []
+    # Final baseline fusion
+    final_labels, final_conf = [], []
     for _, r in df.iterrows():
         lab, conf = fuse_baseline(
             pub_label=str(r["pubmed_label_scored"]),
             pub_score=int(r["pubmed_score"]),
             ct_score=int(r["ctgov_failure_score"]),
         )
-        base_label.append(lab)
-        base_conf.append(conf)
-
-    df["baseline_outcome_label"] = base_label
-    df["baseline_confidence"] = base_conf
-
-    # -------- Gemini fallback (optional) --------
-    gem_label, gem_conf, gem_reason, gem_evidence, gem_http, gem_http_err = [], [], [], [], [], []
-    gem_calls = 0
-
-    for i, r in tqdm(df.iterrows(), total=len(df), desc="Gemini fallback"):
-        if not (GEMINI_ENABLED and GEMINI_API_KEY):
-            gem_label.append("")
-            gem_conf.append(0.0)
-            gem_reason.append("disabled_or_no_key")
-            gem_evidence.append("")
-            gem_http.append(0)
-            gem_http_err.append("")
-            continue
-
-        if gem_calls >= GEMINI_MAX_CALLS:
-            gem_label.append("")
-            gem_conf.append(0.0)
-            gem_reason.append("max_calls_reached")
-            gem_evidence.append("")
-            gem_http.append(0)
-            gem_http_err.append("")
-            continue
-
-        baseline = str(r["baseline_outcome_label"])
-        if baseline in ("met", "not_met"):
-            gem_label.append("")
-            gem_conf.append(0.0)
-            gem_reason.append("baseline_deterministic")
-            gem_evidence.append("")
-            gem_http.append(0)
-            gem_http_err.append("")
-            continue
-
-        text = pub_text_used[i] if i < len(pub_text_used) else ""
-        if not text:
-            gem_label.append("")
-            gem_conf.append(0.0)
-            gem_reason.append("no_pubmed_text")
-            gem_evidence.append("")
-            gem_http.append(0)
-            gem_http_err.append("")
-            continue
-
-        lab, conf, reason, evidence, http_status, http_err = gemini_label_primary_endpoint(text)
-        gem_calls += 1
-
-        gem_label.append(lab)
-        gem_conf.append(conf)
-        gem_reason.append(reason)
-        gem_evidence.append(evidence)
-        gem_http.append(http_status)
-        gem_http_err.append(http_err)
-
-    df["gemini_label"] = gem_label
-    df["gemini_confidence"] = gem_conf
-    df["gemini_reason"] = gem_reason
-    df["gemini_evidence"] = gem_evidence
-    df["gemini_http_status"] = gem_http
-    df["gemini_http_error"] = gem_http_err
-
-    # -------- Final label (Gemini only if confident) --------
-    final_labels, final_conf = [], []
-    for _, r in df.iterrows():
-        base = str(r["baseline_outcome_label"])
-        g_lab = str(r.get("gemini_label", "") or "").strip().lower()
-        g_conf = float(r.get("gemini_confidence", 0.0) or 0.0)
-
-        if g_lab in ("met", "not_met") and g_conf >= GEMINI_MIN_CONFIDENCE:
-            final_labels.append(g_lab)
-            final_conf.append(f"gemini:{g_conf:.2f}")
-        else:
-            final_labels.append(base)
-            final_conf.append(str(r["baseline_confidence"]))
+        final_labels.append(lab)
+        final_conf.append(conf)
 
     df["final_outcome_label"] = final_labels
     df["final_confidence"] = final_conf
 
-    # -------- Sort: year desc, Flow first, then CyTOF, then label rank --------
-    df["year_int"] = df["study_year"].apply(safe_int)
-    df["tech_ord"] = df["technology"].apply(tech_order)
+    # ORDER FINAL CSV BY initial_data_release_date (newest to oldest)
+    df["initial_date_key"] = df["initial_data_release_date"].apply(to_date_sort_key)
+    df = df.sort_values(by=["initial_date_key", "study_accession"], ascending=[False, True]).drop(columns=["initial_date_key"])
 
-    label_rank = {"not_met": 0, "not_met_candidate": 1, "unknown": 2, "met": 3}
-    df["label_rank"] = df["final_outcome_label"].map(label_rank).fillna(99).astype(int)
+    # Cap to <= MAX_ROWS (newest first)
+    df_ranked = cap_latest(df, MAX_ROWS)
 
-    df_sorted = df.sort_values(
-        by=["year_int", "tech_ord", "label_rank", "study_accession"],
-        ascending=[False, True, True, True],
-    ).drop(columns=["year_int", "tech_ord", "label_rank"], errors="ignore").reset_index(drop=True)
-
-    # -------- Cap to <= MAX_ROWS but mixed --------
-    df_ranked = cap_mixed(df_sorted, MAX_ROWS)
-
-    # -------- Outputs (keep attachment filename stable) --------
+    # Outputs
     out_full = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full.csv")
     out_ranked = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_ranked.csv")
 
-    df_sorted.to_csv(out_full, index=False)
+    df.to_csv(out_full, index=False)
     df_ranked.to_csv(out_ranked, index=False)
 
-    print(f"\nGemini calls used: {gem_calls}/{GEMINI_MAX_CALLS}")
-    print(f"Wrote: {out_full}")
+    print(f"\nWrote: {out_full}")
     print(f"Wrote: {out_ranked}")
     print("\nFinal label counts (ranked):")
     print(df_ranked["final_outcome_label"].value_counts(dropna=False))
