@@ -20,7 +20,7 @@ CTGOV_BASE = "https://clinicaltrials.gov/api/v2"
 PUBMED_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "immport-cytometry-pipeline-full/2.0"})
+SESSION.headers.update({"User-Agent": "immport-cytometry-pipeline-full/2.1"})
 
 NCT_RE = re.compile(r"\bNCT\d{8}\b")
 
@@ -80,7 +80,10 @@ def _count_only(data: Dict[str, Any]) -> int:
 
 
 def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
-    counts = {}
+    """
+    ImmPort assayMethod matching is typically exact. This probes which strings work.
+    """
+    counts: Dict[str, int] = {}
     for m in assay_methods:
         params = {
             "clinicalTrial": "Y",
@@ -97,10 +100,7 @@ def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
     return counts
 
 
-def search_immport_studies(
-    assay_method: str,
-    page_size: int = 200,
-) -> List[Dict[str, Any]]:
+def search_immport_studies(assay_method: str, page_size: int = 200) -> List[Dict[str, Any]]:
     from_record = 1
     out: List[Dict[str, Any]] = []
 
@@ -134,7 +134,7 @@ def search_immport_studies(
 
         from_record += page_size
 
-    # de-dup by study_accession
+    # de-dup by SDY
     seen = set()
     dedup = []
     for x in out:
@@ -209,7 +209,7 @@ def extract_study_year_and_date_from_summary(summary_json: Any) -> Tuple[Optiona
 
 
 # -----------------------------
-# CT.gov signals (Option A)
+# CT.gov (Option A)
 # -----------------------------
 def ctgov_get_study(nct: str) -> Dict[str, Any]:
     return get_json(f"{CTGOV_BASE}/studies/{nct}")
@@ -218,19 +218,13 @@ def ctgov_get_study(nct: str) -> Dict[str, Any]:
 def ctgov_status_whystopped(study_json: Dict[str, Any]) -> Tuple[str, str]:
     proto = (study_json or {}).get("protocolSection", {}) or {}
     status_mod = proto.get("statusModule", {}) or {}
-    status = status_mod.get("overallStatus") or ""
-    why = status_mod.get("whyStopped") or ""
-    return str(status), str(why)
+    return str(status_mod.get("overallStatus") or ""), str(status_mod.get("whyStopped") or "")
 
 
 def ctgov_failure_score(status: str, why: str) -> Tuple[int, str]:
-    """
-    Option A scoring:
-    - Terminated/Suspended/Withdrawn => +2
-    - whyStopped contains futility/lack-of-efficacy => +4
-    """
     status_l = (status or "").upper()
     why_l = (why or "").lower()
+
     score = 0
     reasons = []
 
@@ -246,10 +240,13 @@ def ctgov_failure_score(status: str, why: str) -> Tuple[int, str]:
 
 
 # -----------------------------
-# PubMed signals (Option B fallback)
+# PubMed (Option B fallback)
 # -----------------------------
 def efetch_pubmed_title_abstract(pubmed_ids: List[str], batch_size: int = 200, sleep: float = 0.34) -> Dict[str, str]:
     out: Dict[str, str] = {}
+    if not pubmed_ids:
+        return out
+
     for i in range(0, len(pubmed_ids), batch_size):
         batch = pubmed_ids[i : i + batch_size]
         params = {"db": "pubmed", "id": ",".join(batch), "retmode": "xml"}
@@ -274,6 +271,7 @@ def efetch_pubmed_title_abstract(pubmed_ids: List[str], batch_size: int = 200, s
             out[pmid] = " ".join([title] + abstract_parts).strip()
 
         time.sleep(sleep)
+
     return out
 
 
@@ -333,14 +331,6 @@ def pubmed_scored_label(text: str) -> Tuple[str, int, str]:
 # Fusion
 # -----------------------------
 def fuse_labels(pub_label: str, pub_score: int, ct_score: int) -> Tuple[str, str]:
-    """
-    Final label + confidence rationale.
-    Rules:
-    - If PubMed clearly says met/not_met, trust that.
-    - Else if CT.gov has strong futility/inefficacy signal => not_met
-    - Else if CT.gov terminated/suspended => not_met_candidate
-    - Else unknown
-    """
     if pub_label == "not_met" and pub_score >= 4:
         return "not_met", "high: PubMed text"
     if pub_label == "met" and pub_score <= -4:
@@ -355,13 +345,10 @@ def fuse_labels(pub_label: str, pub_score: int, ct_score: int) -> Tuple[str, str
 
 
 # -----------------------------
-# Sorting helpers (your requested order)
+# Sorting helpers
 # -----------------------------
-def tech_sort_key(assay_method: str) -> int:
-    """
-    Flow first, then CyTOF/Mass.
-    """
-    s = (assay_method or "").lower()
+def tech_sort_key(technology: str) -> int:
+    s = (technology or "").lower()
     if "flow" in s:
         return 0
     if "cytof" in s or "mass" in s:
@@ -382,9 +369,18 @@ def safe_int_year(x: Any) -> int:
 # Main
 # -----------------------------
 def main():
-    # 1) Discover assay methods
-    FLOW_METHODS = ["Flow Cytometry"]
-    CYTOF_METHOD_CANDIDATES = [
+    # Flow Cytometry synonyms (ImmPort exact-match; we probe which ones work)
+    FLOW_CANDIDATES = [
+        "Flow Cytometry",
+        "Flow cytometry",
+        "FACS",
+        "Fluorescence-activated cell sorting",
+        "Fluorescence Activated Cell Sorting",
+        "Fluorescence activated cell sorting (FACS)",
+    ]
+
+    # CyTOF/Mass Cytometry synonyms (probe which ones work)
+    CYTOF_CANDIDATES = [
         "Mass Cytometry",
         "Mass cytometry",
         "CyTOF",
@@ -396,27 +392,52 @@ def main():
         "CyTOF (Mass Cytometry)",
     ]
 
-    print("Probing CyTOF/Mass cytometry assayMethod vocabulary…")
-    cy_counts = probe_assay_methods(CYTOF_METHOD_CANDIDATES)
+    print("Probing Flow Cytometry assayMethod vocabulary…")
+    flow_counts = probe_assay_methods(FLOW_CANDIDATES)
+    for k, v in flow_counts.items():
+        print(f"  {k!r}: {v}")
+    WORKING_FLOW = [k for k, v in flow_counts.items() if v and v > 0]
+    if not WORKING_FLOW:
+        # Fallback to the canonical value if probing fails for any reason
+        WORKING_FLOW = ["Flow Cytometry"]
+        print("WARNING: No Flow synonyms returned hits; falling back to 'Flow Cytometry' only.")
+    else:
+        print(f"Using Flow assay methods: {WORKING_FLOW}")
+
+    print("\nProbing CyTOF/Mass cytometry assayMethod vocabulary…")
+    cy_counts = probe_assay_methods(CYTOF_CANDIDATES)
     for k, v in cy_counts.items():
         print(f"  {k!r}: {v}")
+    WORKING_CYTOF = [k for k, v in cy_counts.items() if v and v > 0]
+    if WORKING_CYTOF:
+        print(f"Using CyTOF assay methods: {WORKING_CYTOF}")
+    else:
+        print("WARNING: No CyTOF methods returned hits. Proceeding without CyTOF.")
 
-    working_cytof = [k for k, v in cy_counts.items() if v and v > 0]
-    if not working_cytof:
-        print("WARNING: No CyTOF methods returned hits. Proceeding with Flow Cytometry only.")
+    # Search plan: (exact query string, normalized technology label)
+    search_plan: List[Tuple[str, str]] = []
+    for m in WORKING_FLOW:
+        search_plan.append((m, "Flow Cytometry"))
+    for m in WORKING_CYTOF:
+        search_plan.append((m, "CyTOF/Mass Cytometry"))
 
-    search_plan = [(m, "Flow Cytometry") for m in FLOW_METHODS] + [(m, "CyTOF/Mass Cytometry") for m in working_cytof]
-
-    # 2) Pull ImmPort studies + UI enrichment
+    # Pull ImmPort studies + UI enrichment
     all_rows: List[Dict[str, Any]] = []
-    for assay_method_query, assay_label in search_plan:
-        studies = search_immport_studies(assay_method_query, page_size=200)
-        print(f"{assay_label} via assayMethod={assay_method_query!r}: found {len(studies)} studies")
+    seen = set()  # (SDY, technology) dedup
 
-        for s in tqdm(studies, desc=f"Enrich {assay_label} ({assay_method_query})"):
+    for assay_method_query, technology in search_plan:
+        studies = search_immport_studies(assay_method_query, page_size=200)
+        print(f"\n{technology} via assayMethod={assay_method_query!r}: found {len(studies)} studies")
+
+        for s in tqdm(studies, desc=f"Enrich {technology} ({assay_method_query})"):
             sdy = s.get("study_accession")
             if not sdy:
                 continue
+
+            key = (sdy, technology)
+            if key in seen:
+                continue
+            seen.add(key)
 
             try:
                 ui = immport_ui_bundle(sdy)
@@ -433,8 +454,8 @@ def main():
             all_rows.append(
                 {
                     "study_accession": sdy,
-                    "technology": assay_label,                 # normalized label
-                    "assay_method_raw_query": assay_method_query,  # exact term that matched ImmPort
+                    "technology": technology,
+                    "assay_method_raw_query": assay_method_query,
                     "brief_title": s.get("brief_title", ""),
                     "pubmed_id": ";".join(s.get("pubmed_id", [])) if isinstance(s.get("pubmed_id"), list) else (s.get("pubmed_id") or ""),
                     "condition_or_disease": ";".join(s.get("condition_or_disease", [])) if isinstance(s.get("condition_or_disease"), list) else (s.get("condition_or_disease") or ""),
@@ -446,9 +467,9 @@ def main():
                 }
             )
 
-    df = pd.DataFrame(all_rows).drop_duplicates(subset=["study_accession", "technology"]).reset_index(drop=True)
+    df = pd.DataFrame(all_rows).reset_index(drop=True)
 
-    # 3) Fetch PubMed abstracts in batch
+    # Batch fetch PubMed texts
     df["pubmed_id"] = df["pubmed_id"].fillna("").astype(str)
     unique_pmids = sorted(
         set(
@@ -458,10 +479,10 @@ def main():
             if pmid.strip().isdigit()
         )
     )
-    print(f"Unique PubMed IDs: {len(unique_pmids)}")
+    print(f"\nUnique PubMed IDs: {len(unique_pmids)}")
     pub_texts = efetch_pubmed_title_abstract(unique_pmids, batch_size=200)
 
-    # 4) Score PubMed per row
+    # PubMed scoring per row
     pub_labels, pub_scores, pub_evidence = [], [], []
     for _, r in tqdm(df.iterrows(), total=len(df), desc="PubMed scoring"):
         pmids = [p for p in str(r["pubmed_id"]).split(";") if p.strip().isdigit()]
@@ -481,7 +502,7 @@ def main():
     df["pubmed_score"] = pub_scores
     df["pubmed_evidence_patterns"] = pub_evidence
 
-    # 5) CT.gov scoring per row (best-of up to 5 NCTs)
+    # CT.gov scoring per row (best-of up to 5 NCTs)
     ct_statuses, ct_whys, ct_scores, ct_reasons = [], [], [], []
     for _, r in tqdm(df.iterrows(), total=len(df), desc="CT.gov status/why"):
         ncts = [x for x in str(r["nct_ids"]).split(";") if x.startswith("NCT")]
@@ -520,7 +541,7 @@ def main():
     df["ctgov_failure_score"] = ct_scores
     df["ctgov_failure_reason"] = ct_reasons
 
-    # 6) Fuse
+    # Fuse
     final_label, confidence = [], []
     for _, r in df.iterrows():
         lab, conf = fuse_labels(
@@ -534,29 +555,29 @@ def main():
     df["final_outcome_label"] = final_label
     df["final_confidence"] = confidence
 
-    # 7) Sort output by: year desc, technology order (Flow first), then label rank
+    # Rank & sort: year desc, technology (Flow first), then label rank
     df["year_int"] = df["study_year"].apply(safe_int_year)
     df["tech_order"] = df["technology"].apply(tech_sort_key)
 
     label_rank = {"not_met": 0, "not_met_candidate": 1, "unknown": 2, "met": 3}
     df["label_rank"] = df["final_outcome_label"].map(label_rank).fillna(99).astype(int)
 
-    df_sorted = df.sort_values(
+    df_ranked = df.sort_values(
         by=["year_int", "tech_order", "label_rank", "study_accession"],
         ascending=[False, True, True, True],
     ).drop(columns=["year_int", "tech_order", "label_rank"]).reset_index(drop=True)
 
-    # 8) Write outputs
+    # Write outputs (IMPORTANT: keep ranked filename for email attachment)
     out_full = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full.csv")
-    out_sorted = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_sorted.csv")
+    out_ranked = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_ranked.csv")
 
     df.to_csv(out_full, index=False)
-    df_sorted.to_csv(out_sorted, index=False)
+    df_ranked.to_csv(out_ranked, index=False)
 
-    print(f"Wrote: {out_full}")
-    print(f"Wrote: {out_sorted}")
+    print(f"\nWrote: {out_full}")
+    print(f"Wrote: {out_ranked}")
     print("\nFinal label counts:")
-    print(df_sorted["final_outcome_label"].value_counts(dropna=False))
+    print(df_ranked["final_outcome_label"].value_counts(dropna=False))
 
 
 if __name__ == "__main__":
