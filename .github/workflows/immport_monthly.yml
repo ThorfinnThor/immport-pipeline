@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # Runs on the 1st of every month at 08:00 UTC
-    - cron: "0 8 1 * *"
+    - cron: "0 8 1,15 * *"
 
 jobs:
   run-pipeline:
