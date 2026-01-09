@@ -539,8 +539,13 @@ def main():
     df_ranked = df.sort_values(["rank", "study_year"], ascending=[True, False]).reset_index(drop=True)
 
     # Write outputs
-    df.to_csv("immport_cytometry_candidates_full.csv", index=False)
-    df_ranked.to_csv("immport_cytometry_candidates_full_ranked.csv", index=False)
+    import os
+
+    OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    df.to_csv(os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full.csv"), index=False)
+    df_ranked.to_csv(os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_ranked.csv"), index=False)
 
     print("Wrote immport_cytometry_candidates_full.csv")
     print("Wrote immport_cytometry_candidates_full_ranked.csv")
@@ -551,11 +556,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-import os
 
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-df.to_csv(os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full.csv"), index=False)
-df_ranked.to_csv(os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full_ranked.csv"), index=False)
 
