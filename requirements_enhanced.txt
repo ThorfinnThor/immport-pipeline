@@ -1,0 +1,23 @@
+# Core dependencies (already in your project)
+pandas>=1.5.0
+requests>=2.28.0
+tqdm>=4.64.0
+
+# NEW: Enhanced NLP dependencies for trial outcome classification
+
+# spaCy for linguistic processing
+spacy>=3.7.0
+
+# Transformers for BioBERT/PubMedBERT (optional but recommended)
+transformers>=4.36.0
+torch>=2.1.0  # or tensorflow>=2.15.0
+
+# For CPU-only torch (smaller download):
+# --extra-index-url https://download.pytorch.org/whl/cpu
+# torch>=2.1.0+cpu
+
+# Alternative: if you don't want transformers (pattern-only mode works fine):
+# Just install spacy
+
+# Download spaCy model after install:
+# python -m spacy download en_core_web_sm
