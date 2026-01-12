@@ -11,7 +11,6 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-# NEW: enhanced outcome integration
 from pipeline_integration import integrate_into_pipeline
 
 # -----------------------------
@@ -106,8 +105,7 @@ def _count_only(data: Dict[str, Any]) -> int:
 
 def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
     """
-    ImmPort assayMethod matching is typically exact/case-sensitive-ish in practice.
-    We probe which strings return hits.
+    Probe which ImmPort assayMethod strings return hits.
     """
     counts: Dict[str, int] = {}
     for m in assay_methods:
@@ -130,7 +128,7 @@ def probe_assay_methods(assay_methods: List[str]) -> Dict[str, int]:
 def search_immport_studies(assay_method: str, page_size: int = 200) -> List[Dict[str, Any]]:
     """
     ImmPort /search/study pagination using fromRecord (1-indexed).
-    We also request initial/latest_data_release_date so we can sort by initial date later.
+    We also request initial/latest_data_release_date so we can sort later.
     """
     from_record = 1
     out: List[Dict[str, Any]] = []
@@ -326,14 +324,13 @@ def efetch_pubmed_title_abstract(
 
 
 # -----------------------------
-# Sorting: initial date newest -> oldest
+# Sorting helper
 # -----------------------------
 
 
 def parse_iso_date_tuple(s: Any) -> Tuple[int, int, int]:
     """
     Returns (YYYY, MM, DD) for sorting. Missing/invalid -> (0,0,0).
-    Expects ImmPort initial_data_release_date like 'YYYY-MM-DD'.
     """
     if s is None:
         return (0, 0, 0)
@@ -353,9 +350,7 @@ def parse_iso_date_tuple(s: Any) -> Tuple[int, int, int]:
 
 
 def main() -> None:
-    # -----------------------------
     # 1) Determine working assayMethod strings (probe)
-    # -----------------------------
     FLOW_CANDIDATES = [
         "Flow Cytometry",
         "Flow cytometry",
@@ -400,11 +395,9 @@ def main() -> None:
     for m in working_cytof:
         search_plan.append((m, "CyTOF/Mass Cytometry"))
 
-    # -----------------------------
     # 2) ImmPort search + UI enrichment
-    # -----------------------------
     all_rows: List[Dict[str, Any]] = []
-    seen = set()  # (SDY, technology)
+    seen = set()
 
     for assay_method_query, technology in search_plan:
         studies = search_immport_studies(assay_method_query, page_size=200)
@@ -412,10 +405,7 @@ def main() -> None:
             f"\n{technology} via assayMethod={assay_method_query!r}: "
             f"found {len(studies)} studies"
         )
-        for s in tqdm(
-            studies,
-            desc=f"Enrich {technology} ({assay_method_query})",
-        ):
+        for s in tqdm(studies, desc=f"Enrich {technology} ({assay_method_query})"):
             sdy = s.get("study_accession")
             if not sdy:
                 continue
@@ -427,7 +417,9 @@ def main() -> None:
             try:
                 ui = immport_ui_bundle(sdy)
                 ncts = extract_nct_ids(ui)
-                year, date_raw = extract_study_year_and_date_from_summary(ui.get("summary"))
+                year, date_raw = extract_study_year_and_date_from_summary(
+                    ui.get("summary")
+                )
                 ui_err = ""
                 has_studyfile = True
             except Exception as e:
@@ -465,9 +457,7 @@ def main() -> None:
     df.to_csv(out_candidates, index=False)
     print(f"\nWrote {out_candidates} ({len(df)} rows)")
 
-    # -----------------------------
     # 3) PubMed fetch once (unique PMIDs)
-    # -----------------------------
     df["pubmed_id"] = df["pubmed_id"].fillna("").astype(str)
     unique_pmids = sorted(
         set(
@@ -480,26 +470,22 @@ def main() -> None:
     print(f"Unique PubMed IDs: {len(unique_pmids)}")
     pub_texts = efetch_pubmed_title_abstract(unique_pmids, batch_size=200)
 
-    # -----------------------------
     # 4–6) Enhanced PubMed + CT.gov classification and fusion
-    # -----------------------------
     df = integrate_into_pipeline(df, pub_texts, OUTPUT_DIR)
 
-    # -----------------------------
-    # 7) Outputs (unchanged structure, now with enhanced labels)
-    # -----------------------------
+    # 7) Outputs
     out_full = os.path.join(OUTPUT_DIR, "immport_cytometry_candidates_full.csv")
     df.to_csv(out_full, index=False)
     print(f"Wrote {out_full}")
 
     # A) Final CSV ordered by initial_data_release_date newest -> oldest
     df_sorted = df.copy()
-    df_sorted["initial_date_key"] = df_sorted["initial_data_release_date"].apply(
-        parse_iso_date_tuple
-    )
-    df_sorted["latest_date_key"] = df_sorted["latest_data_release_date"].apply(
-        parse_iso_date_tuple
-    )
+    df_sorted["initial_date_key"] = df_sorted[
+        "initial_data_release_date"
+    ].apply(parse_iso_date_tuple)
+    df_sorted["latest_date_key"] = df_sorted[
+        "latest_data_release_date"
+    ].apply(parse_iso_date_tuple)
     df_sorted = (
         df_sorted.sort_values(
             by=["initial_date_key", "latest_date_key", "study_accession"],
@@ -519,7 +505,7 @@ def main() -> None:
         f"(sorted by initial_data_release_date, capped to MAX_ROWS={MAX_ROWS})"
     )
 
-    # B) Additional useful output: rank by "failed" first
+    # B) Failed-ranked output (robust to missing ctgov_failure_score)
     df_failed = df.copy()
     rank_map = {
         "not_met": 0,
@@ -536,9 +522,22 @@ def main() -> None:
     df_failed["rank"] = (
         df_failed["final_outcome_label"].map(rank_map).fillna(99).astype(int)
     )
+
+    sort_cols = ["rank"]
+    sort_asc = [True]
+
+    # Use CT.gov score if available
+    if "ctgov_failure_score" in df_failed.columns:
+        sort_cols.append("ctgov_failure_score")
+        sort_asc.append(False)
+
+    # Always use pubmed_score as secondary
+    sort_cols.append("pubmed_score")
+    sort_asc.append(False)
+
     df_failed = df_failed.sort_values(
-        ["rank", "ctgov_failure_score", "pubmed_score"],
-        ascending=[True, False, False],
+        sort_cols,
+        ascending=sort_asc,
     ).reset_index(drop=True)
 
     out_failed = os.path.join(OUTPUT_DIR, "immport_failed_trials_ranked.csv")
