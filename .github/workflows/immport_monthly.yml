@@ -21,11 +21,17 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas requests tqdm spacy
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install pandas requests tqdm "click>=8.1,<9" spacy
           python -m spacy download en_core_web_sm
+          python - <<'PY'
+          import click
+          import spacy
+          print("click:", click.__version__)
+          print("spacy:", spacy.__version__)
+          PY
 
-      - name: Run ImmPort pipeline (stable)
+      - name: Run ImmPort pipeline stable
         env:
           OUTPUT_DIR: output
           MAX_ROWS: "100"
@@ -33,7 +39,7 @@ jobs:
         run: |
           python scripts/immport_cytometry_pipeline_full.py
 
-      - name: Run external repository discovery (Zenodo + Figshare)
+      - name: Run external repository discovery Zenodo and Figshare
         env:
           OUTPUT_DIR: output
 
@@ -41,7 +47,7 @@ jobs:
           ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
           FIGSHARE_TOKEN: ${{ secrets.FIGSHARE_TOKEN }}
 
-          # Controls (optional)
+          # Controls optional
           ZENODO_MAX_PAGES: "20"
           CYTOMETRY_CONF_THRESHOLD: "0.45"
           FIGSHARE_MAX_PAGES: "5"
