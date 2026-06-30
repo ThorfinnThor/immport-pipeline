@@ -584,7 +584,6 @@ jobs:
           path: output/*.csv
 
       - name: Create standalone email script
-        if: ${{ secrets.SMTP_HOST != '' && secrets.SMTP_PORT != '' && secrets.SMTP_USERNAME != '' && secrets.SMTP_PASSWORD != '' && secrets.MAIL_TO != '' && secrets.MAIL_FROM != '' }}
         run: |
           cat > .tmp/send_flow_discovery_email_standalone.py <<'PY'
           import glob
