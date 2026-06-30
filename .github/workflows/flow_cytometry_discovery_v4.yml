@@ -1,0 +1,677 @@
+name: Flow Cytometry Dataset Discovery
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs every Monday at 08:30 UTC
+    - cron: "30 8 * * 1"
+
+jobs:
+  discover-flow-cytometry-datasets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install standalone discovery dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install requests
+
+      - name: Create standalone discovery script
+        run: |
+          mkdir -p output .tmp
+          cat > .tmp/flow_discovery_standalone.py <<'PY'
+          import csv
+          import datetime as dt
+          import html
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import time
+          from typing import Any, Dict, Iterable, List, Optional, Tuple
+          from urllib.parse import urlencode
+
+          import requests
+
+          OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
+          MAX_RESULTS = int(os.getenv("FLOW_DISCOVERY_MAX_RESULTS", "250"))
+          MIN_SCORE = float(os.getenv("FLOW_DISCOVERY_MIN_SCORE", "2.5"))
+          ZENODO_MAX_PAGES = int(os.getenv("ZENODO_MAX_PAGES", "4"))
+          ZENODO_PAGE_SIZE = int(os.getenv("ZENODO_PAGE_SIZE", "25"))
+          FIGSHARE_MAX_PAGES = int(os.getenv("FIGSHARE_MAX_PAGES", "4"))
+          FIGSHARE_PAGE_SIZE = int(os.getenv("FIGSHARE_PAGE_SIZE", "50"))
+          FIGSHARE_MAX_DETAILS = int(os.getenv("FIGSHARE_MAX_DETAILS", "120"))
+          EUROPEPMC_MAX_PAGES = int(os.getenv("EUROPEPMC_MAX_PAGES", "2"))
+          EUROPEPMC_PAGE_SIZE = int(os.getenv("EUROPEPMC_PAGE_SIZE", "25"))
+          CTGOV_ENRICH_ENABLED = os.getenv("CTGOV_ENRICH_ENABLED", "1") == "1"
+
+          TODAY = dt.datetime.utcnow().date()
+          RAW_EXTENSIONS = (".fcs", ".lmd")
+          ARCHIVE_EXTENSIONS = (".zip", ".tar", ".tar.gz", ".tgz", ".gz", ".7z", ".rar")
+          WORKSPACE_EXTENSIONS = (".wsp", ".jo", ".flowjo")
+
+          QUERIES = [
+              '"spectral flow cytometry" fcs',
+              '"spectral cytometry" fcs',
+              '"multicolor flow cytometry" fcs',
+              '"high dimensional flow cytometry" fcs',
+              '"flow cytometry" "clinical trial" fcs',
+              '"Cytek Aurora" fcs',
+              '"ID7000" fcs',
+              '"FlowRepository" "clinical trial"',
+              '"FR-FCM" "NCT"',
+              '"ImmPort" "flow cytometry" "clinical trial"',
+          ]
+
+          NCT_RE = re.compile(r"\bNCT\d{8}\b", re.I)
+          FR_FCM_RE = re.compile(r"\bFR[-_]?FCM[-_]?\w{4,}\b", re.I)
+          SDY_RE = re.compile(r"\bSDY\d+\b", re.I)
+          PMID_RE = re.compile(r"\bPMID[:\s]*(\d+)\b", re.I)
+
+          SPECTRAL_TERMS = [
+              "spectral flow", "spectral cytometry", "full spectrum", "unmix", "unmixed",
+              "cytek aurora", "northern lights", "sony id7000", "id7000", "spectral analyzer",
+          ]
+          MULTICOLOR_TERMS = [
+              "multicolor", "multi-color", "multiparameter", "multi-parameter", "high-dimensional",
+              "high dimensional", "18-color", "20-color", "24-color", "30-color", "40-color",
+              "mass cytometry", "cytof",
+          ]
+          CLINICAL_TERMS = [
+              "clinical trial", "phase i", "phase 1", "phase ii", "phase 2", "phase iii", "phase 3",
+              "randomized", "placebo", "interventional", "trial", "patients", "vaccine trial",
+          ]
+          CYTOMETRY_TERMS = [
+              "flow cytometry", "facs", "cytometry", "fcs", "flowjo", "cytek", "bd facs", "aurora",
+              "spectral", "cytof", "mass cytometry",
+          ]
+
+          FIELDNAMES = [
+              "rank", "final_score", "source", "record_id", "title", "published_or_released_date",
+              "newness_date_type", "technology_guess", "spectral_or_multicolor_label",
+              "raw_data_score", "clinical_trial_score", "spectral_or_multicolor_score", "newness_score",
+              "downloadability_score", "has_fcs_file", "has_archive_with_fcs", "has_flowjo_workspace",
+              "raw_file_count", "file_extensions", "raw_file_evidence", "nct_ids", "ctgov_phase",
+              "ctgov_status", "ctgov_interventions", "pmids", "doi", "immport_sdy",
+              "flowrepository_accession", "landing_page_url", "download_urls", "reason_summary",
+              "source_query", "description_snippet",
+          ]
+
+          def clean_text(value: Any, max_len: int = 5000) -> str:
+              if value is None:
+                  return ""
+              text = html.unescape(str(value))
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = re.sub(r"\s+", " ", text).strip()
+              return text[:max_len]
+
+          def lower_blob(*parts: Any) -> str:
+              return clean_text(" ".join(str(p or "") for p in parts), 12000).lower()
+
+          def parse_date(value: Any) -> Optional[dt.date]:
+              if not value:
+                  return None
+              text = str(value).strip()
+              for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y"):
+                  try:
+                      parsed = dt.datetime.strptime(text[:26] if "%f" in fmt else text[:19] if "T" in fmt else text[:10] if fmt == "%Y-%m-%d" else text[:4], fmt)
+                      return parsed.date()
+                  except Exception:
+                      continue
+              match = re.search(r"(20\d{2}|19\d{2})[-/](\d{1,2})[-/](\d{1,2})", text)
+              if match:
+                  y, m, d = map(int, match.groups())
+                  try:
+                      return dt.date(y, m, d)
+                  except Exception:
+                      return None
+              return None
+
+          def newness_score(date_value: Any) -> float:
+              parsed = parse_date(date_value)
+              if not parsed:
+                  return 1.0
+              days = max(0, (TODAY - parsed).days)
+              if days <= 30:
+                  return 10.0
+              if days <= 90:
+                  return 8.0
+              if days <= 180:
+                  return 6.0
+              if days <= 365:
+                  return 4.5
+              if days <= 730:
+                  return 3.0
+              return 1.5
+
+          def uniq(values: Iterable[str]) -> List[str]:
+              seen = set()
+              out = []
+              for value in values:
+                  v = str(value or "").strip()
+                  if not v:
+                      continue
+                  key = v.lower()
+                  if key not in seen:
+                      seen.add(key)
+                      out.append(v)
+              return out
+
+          def safe_get_json(session: requests.Session, url: str, **kwargs: Any) -> Optional[Any]:
+              try:
+                  r = session.get(url, timeout=30, **kwargs)
+                  if r.status_code == 429:
+                      time.sleep(2)
+                      r = session.get(url, timeout=30, **kwargs)
+                  if r.status_code >= 400:
+                      print(f"WARN GET {url} -> HTTP {r.status_code}", file=sys.stderr)
+                      return None
+                  return r.json()
+              except Exception as exc:
+                  print(f"WARN GET {url} failed: {exc}", file=sys.stderr)
+                  return None
+
+          def safe_post_json(session: requests.Session, url: str, **kwargs: Any) -> Optional[Any]:
+              try:
+                  r = session.post(url, timeout=30, **kwargs)
+                  if r.status_code == 429:
+                      time.sleep(2)
+                      r = session.post(url, timeout=30, **kwargs)
+                  if r.status_code >= 400:
+                      print(f"WARN POST {url} -> HTTP {r.status_code}", file=sys.stderr)
+                      return None
+                  return r.json()
+              except Exception as exc:
+                  print(f"WARN POST {url} failed: {exc}", file=sys.stderr)
+                  return None
+
+          def candidate_base(source: str, record_id: str, title: str, date_value: str, url: str, query: str, description: str = "") -> Dict[str, Any]:
+              return {
+                  "source": source,
+                  "record_id": record_id,
+                  "title": clean_text(title, 1000),
+                  "published_or_released_date": date_value or "",
+                  "newness_date_type": "published_or_updated",
+                  "landing_page_url": url or "",
+                  "source_query": query or "",
+                  "description_snippet": clean_text(description, 1000),
+                  "doi": "",
+                  "pmids": "",
+                  "immport_sdy": "",
+                  "flowrepository_accession": "",
+                  "nct_ids": "",
+                  "ctgov_phase": "",
+                  "ctgov_status": "",
+                  "ctgov_interventions": "",
+                  "download_urls": "",
+                  "file_extensions": "",
+                  "raw_file_evidence": "",
+                  "has_fcs_file": "0",
+                  "has_archive_with_fcs": "0",
+                  "has_flowjo_workspace": "0",
+                  "raw_file_count": "0",
+              }
+
+          def detect_file_evidence(c: Dict[str, Any], files: List[Dict[str, str]]) -> None:
+              names = []
+              urls = []
+              exts = []
+              raw_names = []
+              archive_names = []
+              workspace_names = []
+              for f in files:
+                  name = clean_text(f.get("name") or f.get("key") or f.get("filename") or "", 500)
+                  url = f.get("url") or f.get("download_url") or ""
+                  if name:
+                      names.append(name)
+                      lname = name.lower()
+                      for ext in RAW_EXTENSIONS + ARCHIVE_EXTENSIONS + WORKSPACE_EXTENSIONS:
+                          if lname.endswith(ext):
+                              exts.append(ext)
+                      if lname.endswith(RAW_EXTENSIONS):
+                          raw_names.append(name)
+                      if lname.endswith(ARCHIVE_EXTENSIONS) and ("fcs" in lname or "flow" in lname or "cytometry" in lname):
+                          archive_names.append(name)
+                      if lname.endswith(WORKSPACE_EXTENSIONS):
+                          workspace_names.append(name)
+                  if url:
+                      urls.append(url)
+              blob = lower_blob(c.get("title"), c.get("description_snippet"), " ".join(names))
+              c["download_urls"] = "; ".join(uniq(urls))
+              c["file_extensions"] = "; ".join(uniq(exts))
+              c["raw_file_count"] = str(len(raw_names))
+              c["has_fcs_file"] = "1" if raw_names or ".fcs" in blob else "0"
+              c["has_archive_with_fcs"] = "1" if archive_names or (".zip" in blob and "fcs" in blob) else "0"
+              c["has_flowjo_workspace"] = "1" if workspace_names or ".wsp" in blob or "flowjo" in blob else "0"
+              evidence = []
+              if raw_names:
+                  evidence.append("raw files: " + ", ".join(raw_names[:10]))
+              if archive_names:
+                  evidence.append("candidate archives: " + ", ".join(archive_names[:10]))
+              if workspace_names:
+                  evidence.append("workspaces: " + ", ".join(workspace_names[:10]))
+              if not evidence and c["has_fcs_file"] == "1":
+                  evidence.append("metadata mentions .fcs")
+              c["raw_file_evidence"] = " | ".join(evidence)
+
+          def classify_and_score(c: Dict[str, Any]) -> Dict[str, Any]:
+              blob = lower_blob(c.get("title"), c.get("description_snippet"), c.get("raw_file_evidence"), c.get("file_extensions"), c.get("source_query"))
+              ncts = uniq(m.upper() for m in NCT_RE.findall(blob.upper()))
+              frs = uniq(m.upper().replace("_", "-") for m in FR_FCM_RE.findall(blob.upper()))
+              sdys = uniq(m.upper() for m in SDY_RE.findall(blob.upper()))
+              if ncts and not c.get("nct_ids"):
+                  c["nct_ids"] = "; ".join(ncts)
+              if frs and not c.get("flowrepository_accession"):
+                  c["flowrepository_accession"] = "; ".join(frs)
+              if sdys and not c.get("immport_sdy"):
+                  c["immport_sdy"] = "; ".join(sdys)
+
+              raw_score = 0.0
+              if c.get("has_fcs_file") == "1":
+                  raw_score = 10.0
+              elif c.get("has_archive_with_fcs") == "1":
+                  raw_score = 9.0
+              elif c.get("flowrepository_accession"):
+                  raw_score = 8.0
+              elif c.get("has_flowjo_workspace") == "1":
+                  raw_score = 5.5
+              elif ".fcs" in blob or "raw flow" in blob:
+                  raw_score = 5.0
+              elif any(term in blob for term in CYTOMETRY_TERMS):
+                  raw_score = 2.0
+
+              clinical_score = 0.0
+              if c.get("nct_ids"):
+                  clinical_score = 10.0
+              elif any(term in blob for term in CLINICAL_TERMS):
+                  clinical_score = 6.0
+              elif "patient" in blob or "human" in blob:
+                  clinical_score = 3.0
+
+              spectral_score = 0.0
+              label = "unknown"
+              technology = "flow cytometry"
+              if any(term in blob for term in SPECTRAL_TERMS):
+                  spectral_score = 10.0
+                  label = "spectral_flow"
+                  technology = "spectral flow cytometry"
+              elif any(term in blob for term in MULTICOLOR_TERMS):
+                  spectral_score = 7.5
+                  label = "multicolor_or_high_dimensional_flow"
+              elif "flow cytometry" in blob or "facs" in blob or "fcs" in blob:
+                  spectral_score = 4.0
+                  label = "flow_cytometry"
+              elif "cytof" in blob or "mass cytometry" in blob:
+                  spectral_score = 6.0
+                  label = "mass_cytometry_cytof"
+                  technology = "mass cytometry / CyTOF"
+
+              downloadable = 0.0
+              if c.get("download_urls"):
+                  downloadable = 10.0
+              elif c.get("landing_page_url"):
+                  downloadable = 6.0
+
+              new_score = newness_score(c.get("published_or_released_date"))
+              final = 0.30 * raw_score + 0.25 * clinical_score + 0.20 * spectral_score + 0.15 * new_score + 0.10 * downloadable
+
+              c["raw_data_score"] = f"{raw_score:.1f}"
+              c["clinical_trial_score"] = f"{clinical_score:.1f}"
+              c["spectral_or_multicolor_score"] = f"{spectral_score:.1f}"
+              c["newness_score"] = f"{new_score:.1f}"
+              c["downloadability_score"] = f"{downloadable:.1f}"
+              c["final_score"] = f"{final:.3f}"
+              c["technology_guess"] = technology
+              c["spectral_or_multicolor_label"] = label
+
+              reasons = []
+              if raw_score >= 9:
+                  reasons.append("raw FCS/archive evidence")
+              elif raw_score >= 5:
+                  reasons.append("probable cytometry raw-data evidence")
+              if c.get("nct_ids"):
+                  reasons.append("NCT clinical trial ID detected")
+              elif clinical_score >= 6:
+                  reasons.append("clinical-trial language detected")
+              if label != "unknown":
+                  reasons.append(label)
+              if parse_date(c.get("published_or_released_date")):
+                  reasons.append("recentness scored from publication/release date")
+              c["reason_summary"] = "; ".join(reasons) or "low-confidence cytometry-related candidate"
+              return c
+
+          def discover_zenodo(session: requests.Session) -> List[Dict[str, Any]]:
+              out = []
+              token = os.getenv("ZENODO_TOKEN")
+              headers = {}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              for query in QUERIES:
+                  for page in range(1, ZENODO_MAX_PAGES + 1):
+                      params = {"q": query, "sort": "mostrecent", "size": ZENODO_PAGE_SIZE, "page": page}
+                      data = safe_get_json(session, "https://zenodo.org/api/records", params=params, headers=headers)
+                      if not data:
+                          break
+                      hits = data.get("hits", {}).get("hits", [])
+                      if not hits:
+                          break
+                      for rec in hits:
+                          meta = rec.get("metadata", {})
+                          rec_id = str(rec.get("id") or rec.get("conceptrecid") or "")
+                          url = rec.get("links", {}).get("html") or f"https://zenodo.org/records/{rec_id}"
+                          date_value = meta.get("publication_date") or rec.get("updated") or rec.get("created") or ""
+                          c = candidate_base("zenodo", rec_id, meta.get("title", ""), date_value, url, query, meta.get("description", ""))
+                          c["doi"] = meta.get("doi") or rec.get("doi") or ""
+                          files = []
+                          for f in rec.get("files", []) or []:
+                              links = f.get("links", {}) if isinstance(f, dict) else {}
+                              files.append({"name": f.get("key") or f.get("filename") or "", "url": links.get("self") or links.get("content") or ""})
+                          detect_file_evidence(c, files)
+                          out.append(classify_and_score(c))
+                      if len(out) >= MAX_RESULTS:
+                          return out
+              return out
+
+          def discover_figshare(session: requests.Session) -> List[Dict[str, Any]]:
+              out = []
+              detail_count = 0
+              token = os.getenv("FIGSHARE_TOKEN")
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = f"token {token}"
+              for query in QUERIES:
+                  for page in range(1, FIGSHARE_MAX_PAGES + 1):
+                      payload = {"search_for": query, "page": page, "page_size": FIGSHARE_PAGE_SIZE, "order": "published_date", "order_direction": "desc"}
+                      records = safe_post_json(session, "https://api.figshare.com/v2/articles/search", json=payload, headers=headers)
+                      if not records:
+                          break
+                      for rec in records:
+                          rec_id = str(rec.get("id") or "")
+                          detail = rec
+                          if detail_count < FIGSHARE_MAX_DETAILS and rec_id:
+                              got = safe_get_json(session, f"https://api.figshare.com/v2/articles/{rec_id}", headers=headers)
+                              if got:
+                                  detail = got
+                              detail_count += 1
+                          title = detail.get("title") or rec.get("title") or ""
+                          date_value = detail.get("published_date") or detail.get("modified_date") or rec.get("published_date") or ""
+                          url = detail.get("url_public_html") or rec.get("url_public_html") or detail.get("figshare_url") or ""
+                          desc = detail.get("description") or rec.get("description") or ""
+                          c = candidate_base("figshare", rec_id, title, date_value, url, query, desc)
+                          doi = detail.get("doi") or rec.get("doi") or ""
+                          c["doi"] = doi or ""
+                          files = []
+                          for f in detail.get("files", []) or []:
+                              files.append({"name": f.get("name") or f.get("filename") or "", "url": f.get("download_url") or f.get("computed_url") or ""})
+                          detect_file_evidence(c, files)
+                          out.append(classify_and_score(c))
+                      if len(out) >= MAX_RESULTS:
+                          return out
+              return out
+
+          def discover_europepmc(session: requests.Session) -> List[Dict[str, Any]]:
+              out = []
+              epmc_queries = [
+                  '"spectral flow cytometry" AND ("FCS" OR "FlowRepository" OR "Zenodo" OR "Figshare")',
+                  '"flow cytometry" AND "clinical trial" AND ("FCS" OR "FR-FCM" OR "NCT")',
+                  '"Cytek Aurora" AND ("dataset" OR "FCS" OR "FlowRepository")',
+                  '"multicolor flow cytometry" AND "clinical trial" AND "data availability"',
+              ]
+              for query in epmc_queries:
+                  for page in range(1, EUROPEPMC_MAX_PAGES + 1):
+                      params = {"query": query, "format": "json", "pageSize": EUROPEPMC_PAGE_SIZE, "page": page}
+                      data = safe_get_json(session, "https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params)
+                      if not data:
+                          break
+                      results = data.get("resultList", {}).get("result", [])
+                      if not results:
+                          break
+                      for rec in results:
+                          pmid = rec.get("pmid") or ""
+                          doi = rec.get("doi") or ""
+                          rec_id = pmid or doi or rec.get("id") or ""
+                          title = rec.get("title") or ""
+                          desc = " ".join([rec.get("abstractText") or "", rec.get("journalTitle") or "", rec.get("authorString") or ""])
+                          date_value = rec.get("firstPublicationDate") or rec.get("pubYear") or ""
+                          url = f"https://europepmc.org/article/MED/{pmid}" if pmid else (f"https://doi.org/{doi}" if doi else "")
+                          c = candidate_base("europepmc", str(rec_id), title, date_value, url, query, desc)
+                          c["doi"] = doi
+                          c["pmids"] = pmid
+                          detect_file_evidence(c, [])
+                          out.append(classify_and_score(c))
+                      if len(out) >= MAX_RESULTS:
+                          return out
+              return out
+
+          def enrich_ctgov(session: requests.Session, candidates: List[Dict[str, Any]]) -> None:
+              if not CTGOV_ENRICH_ENABLED:
+                  return
+              cache: Dict[str, Tuple[str, str, str]] = {}
+              for c in candidates:
+                  ncts = [x.strip().upper() for x in str(c.get("nct_ids", "")).split(";") if x.strip()]
+                  phases = []
+                  statuses = []
+                  interventions = []
+                  for nct in ncts[:3]:
+                      if nct not in cache:
+                          data = safe_get_json(session, f"https://clinicaltrials.gov/api/v2/studies/{nct}")
+                          phase_text = status_text = intervention_text = ""
+                          if data:
+                              protocol = data.get("protocolSection", {})
+                              design = protocol.get("designModule", {})
+                              status = protocol.get("statusModule", {})
+                              arms = protocol.get("armsInterventionsModule", {})
+                              phase_text = "; ".join(design.get("phases", []) or [])
+                              status_text = status.get("overallStatus", "") or ""
+                              intervention_text = "; ".join(
+                                  uniq(i.get("name", "") for i in arms.get("interventions", []) or [])[:10]
+                              )
+                          cache[nct] = (phase_text, status_text, intervention_text)
+                      p, s, i = cache[nct]
+                      if p:
+                          phases.append(p)
+                      if s:
+                          statuses.append(s)
+                      if i:
+                          interventions.append(i)
+                  if phases:
+                      c["ctgov_phase"] = "; ".join(uniq(phases))
+                  if statuses:
+                      c["ctgov_status"] = "; ".join(uniq(statuses))
+                  if interventions:
+                      c["ctgov_interventions"] = "; ".join(uniq(interventions))
+
+          def dedupe(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+              best: Dict[str, Dict[str, Any]] = {}
+              for c in candidates:
+                  key_parts = [c.get("source", ""), c.get("record_id", "") or c.get("doi", "") or c.get("landing_page_url", "") or c.get("title", "")]
+                  key = "|".join(key_parts).lower()
+                  if not key.strip("|"):
+                      continue
+                  old = best.get(key)
+                  if old is None or float(c.get("final_score", 0) or 0) > float(old.get("final_score", 0) or 0):
+                      best[key] = c
+              return list(best.values())
+
+          def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+                  writer.writeheader()
+                  for row in rows:
+                      clean_row = {k: row.get(k, "") for k in FIELDNAMES}
+                      writer.writerow(clean_row)
+
+          def main() -> None:
+              os.makedirs(OUTPUT_DIR, exist_ok=True)
+              session = requests.Session()
+              session.headers.update({"User-Agent": "immport-flow-discovery/1.0 (+https://github.com/ThorfinnThor/immport-pipeline)"})
+
+              all_candidates: List[Dict[str, Any]] = []
+              for name, func in [("zenodo", discover_zenodo), ("figshare", discover_figshare), ("europepmc", discover_europepmc)]:
+                  print(f"Discovering {name}...")
+                  try:
+                      found = func(session)
+                      print(f"  {name}: {len(found)} candidates")
+                      all_candidates.extend(found)
+                  except Exception as exc:
+                      print(f"WARN {name} failed: {exc}", file=sys.stderr)
+
+              all_candidates = dedupe(all_candidates)
+              enrich_ctgov(session, all_candidates)
+              for c in all_candidates:
+                  classify_and_score(c)
+
+              all_candidates.sort(key=lambda r: float(r.get("final_score", 0) or 0), reverse=True)
+              for i, c in enumerate(all_candidates, 1):
+                  c["rank"] = str(i)
+
+              ranked = [c for c in all_candidates if float(c.get("final_score", 0) or 0) >= MIN_SCORE]
+              high_conf = [
+                  c for c in ranked
+                  if float(c.get("raw_data_score", 0) or 0) >= 7.0 or float(c.get("clinical_trial_score", 0) or 0) >= 7.0
+              ]
+
+              write_csv(os.path.join(OUTPUT_DIR, "flow_cytometry_discovery_all_candidates.csv"), all_candidates)
+              write_csv(os.path.join(OUTPUT_DIR, "flow_cytometry_datasets_ranked.csv"), ranked)
+              write_csv(os.path.join(OUTPUT_DIR, "flow_cytometry_high_confidence_raw_or_trial.csv"), high_conf)
+
+              print("Wrote:")
+              print(f"  {OUTPUT_DIR}/flow_cytometry_discovery_all_candidates.csv ({len(all_candidates)} rows)")
+              print(f"  {OUTPUT_DIR}/flow_cytometry_datasets_ranked.csv ({len(ranked)} rows)")
+              print(f"  {OUTPUT_DIR}/flow_cytometry_high_confidence_raw_or_trial.csv ({len(high_conf)} rows)")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run standalone discovery
+        env:
+          OUTPUT_DIR: output
+          FLOW_DISCOVERY_MAX_RESULTS: "250"
+          FLOW_DISCOVERY_MIN_SCORE: "2.5"
+          ZENODO_MAX_PAGES: "4"
+          ZENODO_PAGE_SIZE: "25"
+          FIGSHARE_MAX_PAGES: "4"
+          FIGSHARE_PAGE_SIZE: "50"
+          FIGSHARE_MAX_DETAILS: "120"
+          EUROPEPMC_MAX_PAGES: "2"
+          EUROPEPMC_PAGE_SIZE: "25"
+          CTGOV_ENRICH_ENABLED: "1"
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          FIGSHARE_TOKEN: ${{ secrets.FIGSHARE_TOKEN }}
+        run: |
+          python .tmp/flow_discovery_standalone.py
+
+      - name: List output files
+        run: |
+          echo "---- output/ ----"
+          ls -lah output || true
+
+      - name: Upload discovery CSVs as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow_cytometry_discovery_outputs
+          path: output/*.csv
+
+      - name: Create standalone email script
+        if: ${{ secrets.SMTP_HOST != '' && secrets.SMTP_PORT != '' && secrets.SMTP_USERNAME != '' && secrets.SMTP_PASSWORD != '' && secrets.MAIL_TO != '' && secrets.MAIL_FROM != '' }}
+        run: |
+          cat > .tmp/send_flow_discovery_email_standalone.py <<'PY'
+          import glob
+          import mimetypes
+          import os
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+          from pathlib import Path
+
+          def required_env(name: str) -> str:
+              value = os.getenv(name, "").strip()
+              if not value:
+                  raise RuntimeError(f"Missing required environment variable: {name}")
+              return value
+
+          smtp_host = required_env("SMTP_HOST")
+          smtp_port = int(required_env("SMTP_PORT"))
+          smtp_username = required_env("SMTP_USERNAME")
+          smtp_password = required_env("SMTP_PASSWORD")
+          mail_to = required_env("MAIL_TO")
+          mail_from = required_env("MAIL_FROM")
+
+          preferred = [
+              "output/flow_cytometry_datasets_ranked.csv",
+              "output/flow_cytometry_high_confidence_raw_or_trial.csv",
+              "output/flow_cytometry_discovery_all_candidates.csv",
+          ]
+          paths = [p for p in preferred if os.path.exists(p)]
+          for p in sorted(glob.glob("output/*.csv")):
+              if p not in paths:
+                  paths.append(p)
+
+          msg = EmailMessage()
+          msg["From"] = mail_from
+          msg["To"] = mail_to
+          msg["Subject"] = "New flow cytometry dataset discovery report"
+
+          lines = [
+              "Hi,",
+              "",
+              "Attached are the latest CSV outputs from the standalone flow cytometry dataset discovery workflow.",
+              "",
+              "Expected key file:",
+              "- output/flow_cytometry_datasets_ranked.csv",
+              "",
+              "Attachments included:",
+          ]
+          if paths:
+              lines.extend(f"- {p} ({os.path.getsize(p)} bytes)" for p in paths)
+          else:
+              lines.append("- No CSV files were found in output/.")
+          lines.extend(["", "This email was sent by the Flow Cytometry Dataset Discovery workflow."])
+          msg.set_content("\n".join(lines))
+
+          for path in paths:
+              ctype, encoding = mimetypes.guess_type(path)
+              if ctype is None or encoding is not None:
+                  ctype = "text/csv"
+              maintype, subtype = ctype.split("/", 1)
+              with open(path, "rb") as f:
+                  msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=Path(path).name)
+
+          context = ssl.create_default_context()
+          if smtp_port == 465:
+              with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+                  server.login(smtp_username, smtp_password)
+                  server.send_message(msg)
+          else:
+              with smtplib.SMTP(smtp_host, smtp_port) as server:
+                  server.starttls(context=context)
+                  server.login(smtp_username, smtp_password)
+                  server.send_message(msg)
+          print(f"Sent discovery email with {len(paths)} attachment(s).")
+          PY
+
+      - name: Send discovery email with CSV attachments
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+        run: |
+          if [ -z "${SMTP_HOST}" ] || [ -z "${SMTP_PORT}" ] || [ -z "${SMTP_USERNAME}" ] || [ -z "${SMTP_PASSWORD}" ] || [ -z "${MAIL_TO}" ] || [ -z "${MAIL_FROM}" ]; then
+            echo "SMTP secrets are not fully configured; skipping discovery email."
+            exit 0
+          fi
+          python .tmp/send_flow_discovery_email_standalone.py
